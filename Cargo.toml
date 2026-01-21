@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "embedvec",
+    "embedvec-py",
+]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/embedvec/embedvec"

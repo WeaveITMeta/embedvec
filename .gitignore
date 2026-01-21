@@ -1,0 +1,66 @@
+# Rust build artifacts
+target/
+target_unit/
+target_test/
+target3/
+target*/
+**/target/
+**/target_unit/
+**/target_test/
+**/target*/
+
+# Cargo lock for libraries (optional - uncomment if you want to ignore)
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test and benchmark artifacts
+**/tests/
+**/benches/
+*.profraw
+*.profdata
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+
+# Persistence test databases
+*.db
+*.sled/
+*.rocksdb/
+
+# Coverage
+*.gcno
+*.gcda
+lcov.info
+tarpaulin-report.html
+
+# Logs
+*.log

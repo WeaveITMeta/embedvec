@@ -1,0 +1,20 @@
+[package]
+name = "embedvec-py"
+version = "0.5.0"
+edition = "2021"
+authors = ["EmbedVec Contributors"]
+description = "Python bindings for embedvec - Fast, lightweight vector database with HNSW and E8 quantization"
+license = "MIT"
+repository = "https://github.com/embedvec/embedvec"
+
+[lib]
+name = "embedvec_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+embedvec = { path = "../embedvec", features = ["python"] }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+serde_json = "1.0"
+
+[build-dependencies]
+pyo3-build-config = "0.22"

@@ -1,0 +1,88 @@
+[package]
+name = "embedvec"
+version = "0.5.0"
+edition = "2021"
+authors = ["EmbedVec Contributors"]
+description = "Fast, lightweight, in-process vector database with HNSW indexing, metadata filtering, E8 quantization, and PyO3 bindings"
+license = "MIT"
+repository = "https://github.com/embedvec/embedvec"
+documentation = "https://docs.rs/embedvec"
+readme = "README.md"
+keywords = ["vector-database", "hnsw", "embedding", "ann", "rag"]
+categories = ["database", "science", "algorithms"]
+
+[features]
+default = ["persistence-sled", "async"]
+# Legacy alias for backward compatibility
+persistence = ["persistence-sled"]
+# Sled backend - pure Rust, good default
+persistence-sled = ["sled"]
+# RocksDB backend - higher performance for large datasets
+persistence-rocksdb = ["rocksdb"]
+async = ["tokio"]
+simd = []  # Enable SIMD optimizations
+python = ["pyo3"]
+# WASM support: disables persistence, uses wee_alloc for smaller binary
+wasm = ["wee_alloc"]
+# Full feature set for benchmarking
+full = ["persistence-sled", "async", "simd"]
+# Full with RocksDB
+full-rocksdb = ["persistence-rocksdb", "async", "simd"]
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "macros"], optional = true }
+
+# Persistence backends
+sled = { version = "0.34", optional = true }
+rocksdb = { version = "0.22", optional = true }
+
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+
+# WASM support
+wee_alloc = { version = "0.4", optional = true }
+
+# Random number generation (for Hadamard signs)
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Ordered floats for priority queues
+ordered-float = "4.0"
+
+# Parking lot for faster locks
+parking_lot = "0.12"
+
+# Thiserror for error handling
+thiserror = "2.0"
+
+# Rayon for parallel processing
+rayon = "1.10"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+criterion = "0.5"
+approx = "0.5"
+tempfile = "3.10"
+
+[[bench]]
+name = "hnsw_bench"
+harness = false
+
+[lib]
+name = "embedvec"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1
+opt-level = 3
