@@ -1,6 +1,6 @@
 [package]
 name = "embedvec"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["EmbedVec Contributors"]
 description = "Fast, lightweight, in-process vector database with HNSW indexing, metadata filtering, E8 quantization, and PyO3 bindings"
