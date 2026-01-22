@@ -19,6 +19,8 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::distance::Distance;
 use crate::filter::parse_simple_filter;
+#[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
+use crate::persistence::BackendConfig;
 use crate::quantization::Quantization;
 use crate::{EmbedVec, Metadata};
 
@@ -79,8 +81,17 @@ impl PyEmbedVec {
             }
         };
 
+        // Convert persist_path to BackendConfig if provided
+        #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
+        let persistence_config = persist_path.map(|p| BackendConfig::new(p));
+        
         // Create EmbedVec using internal constructor
-        let inner = EmbedVec::new_internal(dim, distance, m, ef_construction, quant, persist_path)
+        #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
+        let inner = EmbedVec::new_internal(dim, distance, m, ef_construction, quant, persistence_config)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        
+        #[cfg(not(any(feature = "persistence-sled", feature = "persistence-rocksdb")))]
+        let inner = EmbedVec::new_internal(dim, distance, m, ef_construction, quant)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(Self { inner })
