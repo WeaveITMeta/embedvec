@@ -19,6 +19,8 @@ persistence = ["persistence-sled"]
 persistence-sled = ["sled"]
 # RocksDB backend - higher performance for large datasets
 persistence-rocksdb = ["rocksdb"]
+# pgvector backend - PostgreSQL with native vector search
+persistence-pgvector = ["sqlx", "pgvector"]
 async = ["tokio"]
 simd = []  # Enable SIMD optimizations
 python = ["pyo3"]
@@ -28,6 +30,8 @@ wasm = ["wee_alloc"]
 full = ["persistence-sled", "async", "simd"]
 # Full with RocksDB
 full-rocksdb = ["persistence-rocksdb", "async", "simd"]
+# Full with pgvector
+full-pgvector = ["persistence-pgvector", "async", "simd"]
 
 [dependencies]
 # Serialization
@@ -40,6 +44,10 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "macros"], opt
 # Persistence backends
 sled = { version = "0.34", optional = true }
 rocksdb = { version = "0.22", optional = true }
+
+# pgvector backend (PostgreSQL)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"], optional = true }
+pgvector = { version = "0.4", features = ["sqlx"], optional = true }
 
 # Python bindings
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }

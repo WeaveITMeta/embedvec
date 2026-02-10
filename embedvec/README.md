@@ -266,6 +266,7 @@ embedvec = { version = "0.5", features = ["persistence-sled", "async"] }
 |---------|-------------|---------|
 | `persistence-sled` | On-disk storage via Sled (pure Rust) | ✓ |
 | `persistence-rocksdb` | On-disk storage via RocksDB (higher perf) | ✗ |
+| `persistence-pgvector` | PostgreSQL with native vector search | ✗ |
 | `async` | Tokio async API | ✓ |
 | `python` | PyO3 bindings | ✗ |
 | `simd` | SIMD distance optimizations | ✗ |
@@ -273,7 +274,7 @@ embedvec = { version = "0.5", features = ["persistence-sled", "async"] }
 
 ## Persistence Backends
 
-embedvec supports two persistence backends:
+embedvec supports three persistence backends:
 
 ### Sled (Default)
 Pure Rust embedded database. Good default for most use cases.
@@ -310,6 +311,47 @@ let config = BackendConfig::new("/path/to/db")
 
 let db = EmbedVec::with_backend(config, 768, Distance::Cosine, 32, 200).await?;
 ```
+
+### pgvector (PostgreSQL)
+Native PostgreSQL vector search using the pgvector extension. Best for distributed deployments, existing PostgreSQL infrastructure, and when you need SQL access to your vectors.
+
+```toml
+[dependencies]
+embedvec = { version = "0.5", features = ["persistence-pgvector", "async"] }
+```
+
+```rust
+use embedvec::{BackendConfig, BackendType};
+
+// Configure pgvector backend
+let config = BackendConfig::pgvector(
+    "postgresql://user:password@localhost/mydb",
+    768  // vector dimension
+)
+.table_name("my_vectors")      // optional, default: "embedvec_vectors"
+.index_type("hnsw");           // "hnsw" (default) or "ivfflat"
+
+// Use PgVectorBackend directly for native vector operations
+use embedvec::persistence::PgVectorBackend;
+
+let backend = PgVectorBackend::connect(&config).await?;
+
+// Insert vectors
+backend.insert_vector("doc_123", &embedding, Some(json!({"category": "tech"}))).await?;
+
+// Search with native pgvector (search happens in PostgreSQL)
+let results = backend.search_vectors(&query, 10, Some(128)).await?;
+for (id, external_id, similarity, metadata) in results {
+    println!("{}: {} (score: {:.4})", id, external_id, similarity);
+}
+```
+
+**pgvector features:**
+- Native HNSW or IVFFlat indexes in PostgreSQL
+- Cosine similarity search with `<=>` operator
+- Configurable `ef_search` for HNSW
+- JSONB metadata storage
+- Automatic table and index creation
 
 ## Testing
 
