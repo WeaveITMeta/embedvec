@@ -431,7 +431,7 @@ impl HnswIndex {
             return Ok(self.distance.compute(query, raw_slice));
         }
         // Fall back to decoding for quantized vectors
-        let vector = storage.get(id, codec)?;
+        let vector = storage.get(id, codec, None)?;
         Ok(self.distance.compute(query, &vector))
     }
 
@@ -445,7 +445,7 @@ impl HnswIndex {
         codec: Option<&E8Codec>,
     ) -> Result<()> {
         // Get node vector and current connections
-        let node_vector = storage.get(node_id, codec)?;
+        let node_vector = storage.get(node_id, codec, None)?;
         
         let connections = {
             // Use direct indexing for O(1) lookup
@@ -459,7 +459,7 @@ impl HnswIndex {
         let mut neighbor_dists: Vec<(usize, f32)> = connections
             .iter()
             .filter_map(|&neighbor_id| {
-                storage.get(neighbor_id, codec).ok().map(|v| {
+                storage.get(neighbor_id, codec, None).ok().map(|v| {
                     let dist = self.distance.compute(&node_vector, &v);
                     (neighbor_id, dist)
                 })
@@ -579,7 +579,7 @@ mod tests {
         let dim = vectors.first().map(|v| v.len()).unwrap_or(4);
         let mut storage = VectorStorage::new(dim, Quantization::None);
         for v in vectors {
-            storage.add(v, None).unwrap();
+            storage.add(v, None, None).unwrap();
         }
         storage
     }

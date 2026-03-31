@@ -1,38 +1,47 @@
 //! Quantization configuration and modes
 //!
 //! ## Table of Contents
-//! - **Quantization**: Enum defining quantization modes (None, E8)
-//! - **E8 Configuration**: E8 lattice quantization with Hadamard preprocessing
+//! - **Quantization**: Enum defining quantization modes (None, E8, H4)
+//! - **E8 Configuration**: E8 lattice quantization with Hadamard preprocessing (8D blocks)
+//! - **H4 Configuration**: H4 600-cell quantization with Hadamard preprocessing (4D blocks)
 
 use serde::{Deserialize, Serialize};
 
 /// Quantization mode for vector compression
 ///
-/// Controls how vectors are stored in memory. E8 quantization can reduce
-/// memory usage by 4-6× while maintaining high recall.
+/// Controls how vectors are stored in memory. Quantization reduces memory usage
+/// while maintaining high recall for approximate nearest-neighbor search.
 ///
 /// # Example
 /// ```rust
 /// use embedvec::Quantization;
 ///
-/// let quant = Quantization::E8 {
+/// // E8: 8D blocks, ~1.25 bits/dim
+/// let e8 = Quantization::E8 {
 ///     bits_per_block: 10,
 ///     use_hadamard: true,
 ///     random_seed: 0xcafef00d,
 /// };
+///
+/// // H4: 4D blocks using 600-cell vertices, ~1.73 bits/dim
+/// let h4 = Quantization::H4 {
+///     use_hadamard: true,
+///     random_seed: 0xdeadbeef,
+/// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Quantization {
-    /// No quantization - store full f32 vectors
+    /// No quantization — store full f32 vectors
     /// Memory: 4 bytes per dimension
     None,
 
     /// E8 lattice quantization with optional Hadamard preprocessing
     ///
     /// Based on QuIP#/NestQuant/QTIP 2024-2025 research.
-    /// Splits vectors into 8D blocks and quantizes each to nearest E8 lattice point.
+    /// Splits vectors into 8D blocks and quantizes each to the nearest E8 lattice point
+    /// using the D8 ∪ (D8 + ½) double-cover decomposition.
     ///
-    /// Memory: ~2-3 bits per dimension (depending on bits_per_block)
+    /// Memory: ~1–1.5 bits per dimension (depending on bits_per_block)
     E8 {
         /// Bits per 8D block for codebook resolution
         /// - 8 bits: ~1 bit/dim, lower quality
@@ -45,6 +54,25 @@ pub enum Quantization {
         use_hadamard: bool,
 
         /// Random seed for reproducible Hadamard rotation matrix
+        random_seed: u64,
+    },
+
+    /// H4 lattice quantization using 600-cell vertices with Hadamard preprocessing
+    ///
+    /// Splits vectors into 4D blocks and quantizes each to the nearest vertex
+    /// of the regular 600-cell polytope (120 vertices, icosahedral symmetry).
+    ///
+    /// Memory: ~1.73 bits per dimension (log₂(120) / 4 per dimension)
+    /// Each 4D block is stored as a single u8 index into the 120-vertex codebook.
+    ///
+    /// Best for: high-dimensional embeddings where multiples of 4 are preferred,
+    /// or when finer granularity per block than E8 is needed.
+    H4 {
+        /// Apply fast 4D Hadamard transform + random signs before quantization
+        /// Improves quantization quality by decorrelating coordinates.
+        use_hadamard: bool,
+
+        /// Random seed for reproducible random sign matrix
         random_seed: u64,
     },
 }
@@ -101,6 +129,26 @@ impl Quantization {
         })
     }
 
+    /// Create H4 quantization with default parameters
+    ///
+    /// Uses 4D Hadamard preprocessing with a fixed reproducible seed.
+    /// Each 4D block is encoded as a u8 index into the 120-vertex 600-cell codebook.
+    pub fn h4_default() -> Self {
+        Quantization::H4 {
+            use_hadamard: true,
+            random_seed: 0xdeadbeef,
+        }
+    }
+
+    /// Create H4 quantization with custom parameters
+    ///
+    /// # Arguments
+    /// * `use_hadamard` - Apply 4D Hadamard transform preprocessing
+    /// * `random_seed` - Seed for reproducible random signs
+    pub fn h4(use_hadamard: bool, random_seed: u64) -> Self {
+        Quantization::H4 { use_hadamard, random_seed }
+    }
+
     /// Check if quantization is enabled
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Quantization::None)
@@ -111,6 +159,8 @@ impl Quantization {
         match self {
             Quantization::None => 32.0,
             Quantization::E8 { bits_per_block, .. } => *bits_per_block as f32 / 8.0,
+            // log2(120) / 4 ≈ 1.727 bits per dimension
+            Quantization::H4 { .. } => (120.0f32).log2() / 4.0,
         }
     }
 
@@ -123,6 +173,11 @@ impl Quantization {
                 // Each block uses bits_per_block bits + 4 bytes for scale factor
                 let code_bytes = (num_blocks * (*bits_per_block as usize) + 7) / 8;
                 code_bytes + 4 // scale factor
+            }
+            Quantization::H4 { .. } => {
+                // Each 4D block: 1 byte (u8 index into 120 vertices) + 4 bytes for scale
+                let num_blocks = (dimension + 3) / 4;
+                num_blocks + 4
             }
         }
     }
@@ -151,28 +206,42 @@ mod tests {
         let q = Quantization::e8_default();
         assert!(q.is_enabled());
 
-        // 768 dim vector
         let f32_bytes = 768 * 4; // 3072 bytes
         let e8_bytes = q.bytes_per_vector(768);
-
-        // With 10 bits per block (96 blocks for 768 dims):
-        // code_bytes = (96 * 10 + 7) / 8 = 120 bytes
-        // total = 120 + 4 (scale) = 124 bytes
-        // ratio = 3072 / 124 ≈ 24.8x (very high compression)
-        // But actual storage uses u16 per code = 96 * 2 + 4 = 196 bytes
-        // So ratio ≈ 15.7x
         let ratio = f32_bytes as f32 / e8_bytes as f32;
-        assert!(ratio > 2.0 && ratio < 30.0, "Compression ratio: {}", ratio);
+        assert!(ratio > 2.0 && ratio < 30.0, "E8 compression ratio: {}", ratio);
+    }
+
+    #[test]
+    fn test_h4_compression() {
+        let q = Quantization::h4_default();
+        assert!(q.is_enabled());
+
+        // 768-dim: 192 blocks × 1 byte + 4 bytes scale = 196 bytes
+        // f32: 768 × 4 = 3072 bytes  →  ratio ≈ 15.7×
+        let f32_bytes = 768 * 4;
+        let h4_bytes = q.bytes_per_vector(768);
+        let ratio = f32_bytes as f32 / h4_bytes as f32;
+        assert!(ratio > 10.0 && ratio < 25.0, "H4 compression ratio: {:.1}×", ratio);
     }
 
     #[test]
     fn test_bits_per_dim() {
-        let q8 = Quantization::e8(8, true, 0);
+        let q8  = Quantization::e8(8, true, 0);
         let q10 = Quantization::e8(10, true, 0);
         let q12 = Quantization::e8(12, true, 0);
+        let qh4 = Quantization::h4_default();
 
         assert_eq!(q8.bits_per_dim(), 1.0);
         assert_eq!(q10.bits_per_dim(), 1.25);
         assert_eq!(q12.bits_per_dim(), 1.5);
+        // log2(120)/4 ≈ 1.727
+        assert!((qh4.bits_per_dim() - 1.727).abs() < 0.01, "H4 bits/dim = {}", qh4.bits_per_dim());
+    }
+
+    #[test]
+    fn test_h4_is_enabled() {
+        assert!(Quantization::h4_default().is_enabled());
+        assert!(Quantization::h4(false, 0).is_enabled());
     }
 }

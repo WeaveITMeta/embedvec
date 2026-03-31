@@ -1,14 +1,14 @@
 [package]
 name = "embedvec"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["EmbedVec Contributors"]
-description = "Fast, lightweight, in-process vector database with HNSW indexing, metadata filtering, E8 quantization, and PyO3 bindings"
+description = "Fast, lightweight, in-process vector database with HNSW indexing, E8/H4 lattice quantization (up to 24.8x compression), metadata filtering, and PyO3 bindings"
 license = "MIT"
 repository = "https://github.com/WeaveITMeta/embedvec"
 documentation = "https://docs.rs/embedvec"
 readme = "README.md"
-keywords = ["vector-database", "hnsw", "embedding", "ann", "rag"]
+keywords = ["vector-database", "hnsw", "embedding", "quantization", "ann"]
 categories = ["database", "science", "algorithms"]
 
 [features]

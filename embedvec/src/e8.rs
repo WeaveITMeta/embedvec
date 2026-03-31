@@ -134,9 +134,11 @@ impl E8Codec {
             points.push(E8Point {
                 coords: std::array::from_fn(|i| {
                     if is_half {
-                        (point[i] - 0.5) as i8
+                        // Store integer offset: actual coord = coords[i] + 0.5
+                        // Round to nearest integer before truncating to avoid truncation bias
+                        (point[i] - 0.5).round() as i8
                     } else {
-                        point[i] as i8
+                        point[i].round() as i8
                     }
                 }),
                 is_half,
@@ -415,7 +417,7 @@ impl E8Oracle {
                 + (r4 as i32) + (r5 as i32) + (r6 as i32) + (r7 as i32);
         
         if sum & 1 != 0 {
-            // Find coordinate with largest residual magnitude
+            // Find coordinate with smallest residual magnitude — adjusting it costs least
             let res = [
                 (x[0] - r0).abs(),
                 (x[1] - r1).abs(),
@@ -427,12 +429,12 @@ impl E8Oracle {
                 (x[7] - r7).abs(),
             ];
             
-            // Find max residual index
+            // Find min residual index (flip the cheapest coordinate to restore even-sum parity)
             let mut max_idx = 0;
-            let mut max_val = res[0];
+            let mut min_val = res[0];
             for i in 1..8 {
-                if res[i] > max_val {
-                    max_val = res[i];
+                if res[i] < min_val {
+                    min_val = res[i];
                     max_idx = i;
                 }
             }
@@ -484,20 +486,25 @@ impl E8Oracle {
     }
 
     /// Decode code back to E8 point (legacy - kept for compatibility)
+    ///
+    /// Bit layout (16 bits): bit15 = is_d8_half flag, bits 14-0 packed as 8 × 2-bit
+    /// signed offsets (indices 0-7 occupy bits 1-0, 3-2, 5-4, 7-6, 9-8, 11-10, 13-12, 14(1bit)
+    /// — this is a legacy approximation and should not be used for precision work).
     pub fn decode_point(code: u16) -> [f32; 8] {
         let is_d8_half = (code & 0x8000) != 0;
         let base_code = code & 0x7FFF;
 
-        // Simple decoding (inverse of encoding)
         let mut point: [f32; 8] = [0.0; 8];
         
+        // Each coordinate occupies 2 bits at position i*2 (for i 0..7, capped to 15 bits)
         for i in 0..8 {
-            let vi = ((base_code >> (i * 2 % 16)) & 0x3) as i32;
-            // Map 0,1,2,3 to -1,0,1,2 range
+            let shift = (i * 2).min(14);
+            let vi = ((base_code >> shift) & 0x3) as i32;
+            // Map 2-bit value 0,1,2,3 → -1, 0, +1, +2
             point[i] = (vi - 1) as f32;
         }
 
-        // Ensure D8 constraint (sum even)
+        // Restore D8 parity constraint (sum must be even)
         let sum: i32 = point.iter().map(|&v| v as i32).sum();
         if sum % 2 != 0 {
             point[0] += 1.0;
@@ -616,9 +623,8 @@ mod tests {
             .sum::<f32>()
             / 768.0;
 
-        // MSE depends on quantization quality - current implementation has higher error
-        // This is acceptable for a first implementation; can be improved with better E8 oracle
-        assert!(mse < 10.0, "MSE too high: {}", mse);
+        // MSE should be modest with correct D8 parity fix and proper rounding
+        assert!(mse < 0.5, "MSE too high: {}", mse);
     }
 
     #[test]

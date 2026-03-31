@@ -1,11 +1,12 @@
 //! Vector Storage Module
 //!
 //! ## Table of Contents
-//! - **VectorStorage**: Main storage for vectors (raw f32 or E8-quantized)
+//! - **VectorStorage**: Main storage for vectors (raw f32, E8-quantized, or H4-quantized)
 //! - **StoredVector**: Enum representing stored vector format
 //! - **Storage operations**: add, get, clear, re-quantization
 
 use crate::e8::{E8Codec, E8EncodedVector};
+use crate::h4::{H4Codec, H4EncodedVector};
 use crate::error::{EmbedVecError, Result};
 use crate::quantization::Quantization;
 use serde::{Deserialize, Serialize};
@@ -15,21 +16,31 @@ use serde::{Deserialize, Serialize};
 pub enum StoredVector {
     /// Raw f32 vector (no quantization)
     Raw(Vec<f32>),
-    /// E8-quantized vector
+    /// E8-quantized vector (8D blocks, D8 ∪ D8+½ decomposition)
     E8(E8EncodedVector),
+    /// H4-quantized vector (4D blocks, 600-cell vertex indices)
+    H4(H4EncodedVector),
 }
 
 impl StoredVector {
     /// Get the raw f32 vector (decoding if necessary)
-    pub fn to_f32(&self, codec: Option<&E8Codec>) -> Vec<f32> {
+    pub fn to_f32(&self, e8_codec: Option<&E8Codec>, h4_codec: Option<&H4Codec>) -> Vec<f32> {
         match self {
             StoredVector::Raw(v) => v.clone(),
             StoredVector::E8(encoded) => {
-                if let Some(c) = codec {
+                if let Some(c) = e8_codec {
                     c.decode(encoded)
                 } else {
                     // Fallback: return zeros if no codec (shouldn't happen)
                     vec![0.0; encoded.points.len() * 8]
+                }
+            }
+            StoredVector::H4(encoded) => {
+                if let Some(c) = h4_codec {
+                    c.decode(encoded)
+                } else {
+                    // Fallback: return zeros if no codec (shouldn't happen)
+                    vec![0.0; encoded.indices.len() * 4]
                 }
             }
         }
@@ -40,6 +51,7 @@ impl StoredVector {
         match self {
             StoredVector::Raw(v) => v.len() * 4,
             StoredVector::E8(encoded) => encoded.size_bytes(),
+            StoredVector::H4(encoded) => encoded.size_bytes(),
         }
     }
 }
@@ -79,20 +91,36 @@ impl VectorStorage {
     ///
     /// # Arguments
     /// * `vector` - Raw f32 vector to store
-    /// * `codec` - Optional E8 codec for quantization
+    /// * `e8_codec` - Optional E8 codec (required when quantization is E8)
+    /// * `h4_codec` - Optional H4 codec (required when quantization is H4)
     ///
     /// # Returns
     /// Assigned vector ID
-    pub fn add(&mut self, vector: &[f32], codec: Option<&E8Codec>) -> Result<usize> {
+    pub fn add(
+        &mut self,
+        vector: &[f32],
+        e8_codec: Option<&E8Codec>,
+        h4_codec: Option<&H4Codec>,
+    ) -> Result<usize> {
         let stored = match &self.quantization {
             Quantization::None => StoredVector::Raw(vector.to_vec()),
             Quantization::E8 { .. } => {
-                if let Some(c) = codec {
+                if let Some(c) = e8_codec {
                     let encoded = c.encode(vector)?;
                     StoredVector::E8(encoded)
                 } else {
                     return Err(EmbedVecError::QuantizationError(
                         "E8 codec required for E8 quantization".to_string(),
+                    ));
+                }
+            }
+            Quantization::H4 { .. } => {
+                if let Some(c) = h4_codec {
+                    let encoded = c.encode(vector)?;
+                    StoredVector::H4(encoded)
+                } else {
+                    return Err(EmbedVecError::QuantizationError(
+                        "H4 codec required for H4 quantization".to_string(),
                     ));
                 }
             }
@@ -108,15 +136,21 @@ impl VectorStorage {
     ///
     /// # Arguments
     /// * `id` - Vector ID
-    /// * `codec` - Optional E8 codec for decoding
+    /// * `e8_codec` - Optional E8 codec for decoding
+    /// * `h4_codec` - Optional H4 codec for decoding
     ///
     /// # Returns
     /// Raw f32 vector (decoded if quantized)
     #[inline]
-    pub fn get(&self, id: usize, codec: Option<&E8Codec>) -> Result<Vec<f32>> {
+    pub fn get(
+        &self,
+        id: usize,
+        e8_codec: Option<&E8Codec>,
+        h4_codec: Option<&H4Codec>,
+    ) -> Result<Vec<f32>> {
         self.vectors
             .get(id)
-            .map(|v| v.to_f32(codec))
+            .map(|v| v.to_f32(e8_codec, h4_codec))
             .ok_or(EmbedVecError::VectorNotFound(id))
     }
 
@@ -137,9 +171,14 @@ impl VectorStorage {
     }
     
     /// Batch get multiple vectors by IDs (more efficient than individual gets)
-    pub fn get_batch(&self, ids: &[usize], codec: Option<&E8Codec>) -> Vec<Option<Vec<f32>>> {
+    pub fn get_batch(
+        &self,
+        ids: &[usize],
+        e8_codec: Option<&E8Codec>,
+        h4_codec: Option<&H4Codec>,
+    ) -> Vec<Option<Vec<f32>>> {
         ids.iter()
-            .map(|&id| self.vectors.get(id).map(|v| v.to_f32(codec)))
+            .map(|&id| self.vectors.get(id).map(|v| v.to_f32(e8_codec, h4_codec)))
             .collect()
     }
 
@@ -177,11 +216,13 @@ impl VectorStorage {
     ///
     /// # Arguments
     /// * `new_quantization` - New quantization mode
-    /// * `codec` - E8 codec (required if switching to E8)
+    /// * `e8_codec` - E8 codec (required if switching to or from E8)
+    /// * `h4_codec` - H4 codec (required if switching to or from H4)
     pub fn set_quantization(
         &mut self,
         new_quantization: Quantization,
-        codec: Option<&E8Codec>,
+        e8_codec: Option<&E8Codec>,
+        h4_codec: Option<&H4Codec>,
     ) -> Result<()> {
         if self.quantization == new_quantization {
             return Ok(());
@@ -192,19 +233,29 @@ impl VectorStorage {
         let mut new_memory = 0usize;
 
         for stored in &self.vectors {
-            // First decode to f32
-            let raw = stored.to_f32(codec);
+            // First decode to f32 using whichever codec applies to current format
+            let raw = stored.to_f32(e8_codec, h4_codec);
 
             // Then encode with new quantization
             let new_stored = match &new_quantization {
                 Quantization::None => StoredVector::Raw(raw),
                 Quantization::E8 { .. } => {
-                    if let Some(c) = codec {
+                    if let Some(c) = e8_codec {
                         let encoded = c.encode(&raw)?;
                         StoredVector::E8(encoded)
                     } else {
                         return Err(EmbedVecError::QuantizationError(
                             "E8 codec required for E8 quantization".to_string(),
+                        ));
+                    }
+                }
+                Quantization::H4 { .. } => {
+                    if let Some(c) = h4_codec {
+                        let encoded = c.encode(&raw)?;
+                        StoredVector::H4(encoded)
+                    } else {
+                        return Err(EmbedVecError::QuantizationError(
+                            "H4 codec required for H4 quantization".to_string(),
                         ));
                     }
                 }
@@ -238,7 +289,8 @@ impl VectorStorage {
         &self,
         query: &[f32],
         id: usize,
-        codec: Option<&E8Codec>,
+        e8_codec: Option<&E8Codec>,
+        h4_codec: Option<&H4Codec>,
         distance_fn: impl Fn(&[f32], &[f32]) -> f32,
     ) -> Result<f32> {
         let stored = self
@@ -249,13 +301,22 @@ impl VectorStorage {
         match stored {
             StoredVector::Raw(v) => Ok(distance_fn(query, v)),
             StoredVector::E8(encoded) => {
-                if let Some(c) = codec {
-                    // Asymmetric: decode on-the-fly
+                if let Some(c) = e8_codec {
                     let decoded = c.decode(encoded);
                     Ok(distance_fn(query, &decoded))
                 } else {
                     Err(EmbedVecError::QuantizationError(
                         "E8 codec required for distance computation".to_string(),
+                    ))
+                }
+            }
+            StoredVector::H4(encoded) => {
+                if let Some(c) = h4_codec {
+                    let decoded = c.decode(encoded);
+                    Ok(distance_fn(query, &decoded))
+                } else {
+                    Err(EmbedVecError::QuantizationError(
+                        "H4 codec required for distance computation".to_string(),
                     ))
                 }
             }
@@ -277,34 +338,57 @@ mod tests {
         let mut storage = VectorStorage::new(4, Quantization::None);
 
         let v1 = vec![1.0, 2.0, 3.0, 4.0];
-        let id = storage.add(&v1, None).unwrap();
+        let id = storage.add(&v1, None, None).unwrap();
         assert_eq!(id, 0);
 
-        let retrieved = storage.get(0, None).unwrap();
+        let retrieved = storage.get(0, None, None).unwrap();
         assert_eq!(retrieved, v1);
     }
 
     #[test]
     fn test_e8_storage() {
+        use crate::e8::E8Codec;
         let codec = E8Codec::new(16, 10, true, 42);
         let mut storage = VectorStorage::new(16, Quantization::e8_default());
 
         let v1: Vec<f32> = (0..16).map(|i| i as f32 * 0.1).collect();
-        let id = storage.add(&v1, Some(&codec)).unwrap();
+        let id = storage.add(&v1, Some(&codec), None).unwrap();
         assert_eq!(id, 0);
 
-        let retrieved = storage.get(0, Some(&codec)).unwrap();
+        let retrieved = storage.get(0, Some(&codec), None).unwrap();
         assert_eq!(retrieved.len(), 16);
 
         // Check that it's approximately equal (quantization introduces error)
-        // Current E8 implementation has higher error - acceptable for first version
         let mse: f32 = v1
             .iter()
             .zip(retrieved.iter())
             .map(|(a, b)| (a - b).powi(2))
             .sum::<f32>()
             / 16.0;
-        assert!(mse < 10.0, "MSE too high: {}", mse);
+        assert!(mse < 1.0, "MSE too high: {}", mse);
+    }
+
+    #[test]
+    fn test_h4_storage() {
+        use crate::h4::H4Codec;
+        let codec = H4Codec::new(16, true, 42);
+        let mut storage = VectorStorage::new(16, Quantization::h4_default());
+
+        let v1: Vec<f32> = (0..16).map(|i| (i as f32 * 0.3).sin()).collect();
+        let id = storage.add(&v1, None, Some(&codec)).unwrap();
+        assert_eq!(id, 0);
+
+        let retrieved = storage.get(0, None, Some(&codec)).unwrap();
+        assert_eq!(retrieved.len(), 16);
+
+        // H4 is a lossy quantizer
+        let mse: f32 = v1
+            .iter()
+            .zip(retrieved.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / 16.0;
+        assert!(mse < 1.0, "H4 MSE too high: {}", mse);
     }
 
     #[test]
@@ -313,7 +397,7 @@ mod tests {
 
         for _ in 0..10 {
             let v: Vec<f32> = vec![0.0; 768];
-            storage.add(&v, None).unwrap();
+            storage.add(&v, None, None).unwrap();
         }
 
         assert_eq!(storage.memory_bytes(), 768 * 4 * 10);
@@ -322,7 +406,7 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut storage = VectorStorage::new(4, Quantization::None);
-        storage.add(&[1.0, 2.0, 3.0, 4.0], None).unwrap();
+        storage.add(&[1.0, 2.0, 3.0, 4.0], None, None).unwrap();
         
         assert_eq!(storage.len(), 1);
         storage.clear();

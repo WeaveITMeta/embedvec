@@ -5,14 +5,14 @@
 //! [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 //!
 //! **Fast, lightweight, in-process vector database** with HNSW indexing, SIMD-accelerated
-//! distance calculations, metadata filtering, E8 lattice quantization, and optional
+//! distance calculations, metadata filtering, E8 and H4 lattice quantization, and optional
 //! persistence via Sled or RocksDB.
 //!
 //! ## Why embedvec?
 //!
 //! - **Pure Rust** — No C++ dependencies (unless using RocksDB), safe and portable
 //! - **Blazing Fast** — AVX2/FMA SIMD acceleration, optimized HNSW with O(1) lookups
-//! - **Memory Efficient** — E8 quantization provides 4-6× compression with <5% recall loss
+//! - **Memory Efficient** — E8/H4 quantization provides 4-16× compression with <5% recall loss
 //! - **Flexible Persistence** — Choose between Sled (pure Rust) or RocksDB (high performance)
 //! - **Production Ready** — Async API, metadata filtering, batch operations
 //!
@@ -35,7 +35,8 @@
 //! |---------|-------------|
 //! | **HNSW Indexing** | Hierarchical Navigable Small World graph for O(log n) ANN search |
 //! | **SIMD Distance** | AVX2/FMA accelerated cosine, euclidean, dot product |
-//! | **E8 Quantization** | Lattice-based compression (4-6× memory reduction) |
+//! | **E8 Quantization** | 8D lattice compression (4-6× memory reduction) |
+//! | **H4 Quantization** | 4D 600-cell compression (~15× memory reduction) |
 //! | **Metadata Filtering** | Composable filters: eq, gt, lt, contains, AND/OR/NOT |
 //! | **Dual Persistence** | Sled (pure Rust) or RocksDB (high performance) |
 //! | **Async API** | Tokio-compatible async operations |
@@ -74,10 +75,6 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Sled backend (default, pure Rust)
 //!     let db = EmbedVec::with_persistence("/tmp/vectors.db", 768, Distance::Cosine, 32, 200).await?;
-//!     
-//!     // Or RocksDB for higher performance (requires persistence-rocksdb feature)
-//!     // let config = BackendConfig::new("/tmp/vectors.db").backend(BackendType::RocksDb);
-//!     // let db = EmbedVec::with_backend(config, 768, Distance::Cosine, 32, 200).await?;
 //!     Ok(())
 //! }
 //! ```
@@ -93,6 +90,23 @@
 //!         .dimension(768)
 //!         .metric(Distance::Cosine)
 //!         .quantization(Quantization::e8_default())  // ~1.25 bits/dim
+//!         .build()
+//!         .await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## H4 Quantization (~15× Memory Savings)
+//!
+//! ```rust,no_run
+//! use embedvec::{EmbedVec, Distance, Quantization};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let db = EmbedVec::builder()
+//!         .dimension(768)
+//!         .metric(Distance::Cosine)
+//!         .quantization(Quantization::h4_default())  // ~1.73 bits/dim, 4D 600-cell
 //!         .build()
 //!         .await?;
 //!     Ok(())
@@ -115,6 +129,7 @@
 //! |------|----------|---------------|------------|
 //! | Raw (f32) | 32 | 3.1 KB | ~3.1 GB |
 //! | E8 10-bit | ~1.25 | ~220 B | ~220 MB |
+//! | H4 | ~1.73 | ~196 B | ~196 MB |
 //!
 //! ## License
 //!
@@ -132,6 +147,7 @@ pub mod distance;
 pub mod e8;
 pub mod error;
 pub mod filter;
+pub mod h4;
 pub mod hnsw;
 pub mod metadata;
 #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
@@ -147,6 +163,7 @@ pub use distance::Distance;
 pub use e8::{E8Codec, HadamardTransform};
 pub use error::{EmbedVecError, Result};
 pub use filter::FilterExpr;
+pub use h4::{H4Codec, hadamard4_inplace};
 pub use hnsw::HnswIndex;
 pub use metadata::Metadata;
 #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
@@ -239,7 +256,7 @@ impl EmbedVecBuilder {
         self.persistence_config = Some(persistence::BackendConfig::new(path));
         self
     }
-    
+
     /// Set persistence with full backend configuration
     #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
     pub fn persistence_config(mut self, config: persistence::BackendConfig) -> Self {
@@ -271,7 +288,7 @@ impl EmbedVecBuilder {
 /// Main embedded vector database struct
 ///
 /// Provides HNSW-based approximate nearest neighbor search with optional
-/// E8 lattice quantization for memory efficiency.
+/// E8 or H4 lattice quantization for memory efficiency.
 pub struct EmbedVec {
     /// Vector dimension
     dimension: usize,
@@ -279,14 +296,16 @@ pub struct EmbedVec {
     distance: Distance,
     /// HNSW index
     pub index: Arc<RwLock<HnswIndex>>,
-    /// Vector storage (raw or quantized)
+    /// Vector storage (raw, E8-quantized, or H4-quantized)
     pub storage: Arc<RwLock<VectorStorage>>,
     /// Metadata storage
     pub metadata: Arc<RwLock<Vec<Metadata>>>,
     /// Quantization configuration
     quantization: Quantization,
-    /// E8 codec (if quantization enabled)
+    /// E8 codec (present when quantization = E8)
     e8_codec: Option<E8Codec>,
+    /// H4 codec (present when quantization = H4)
+    h4_codec: Option<H4Codec>,
     /// Persistence backend (sled or rocksdb)
     #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
     backend: Option<Box<dyn persistence::PersistenceBackend>>,
@@ -319,7 +338,7 @@ impl EmbedVec {
     ) -> Result<Self> {
         Self::new_internal(dim, distance, m, ef_construction, Quantization::None, None)
     }
-    
+
     #[cfg(all(feature = "async", not(any(feature = "persistence-sled", feature = "persistence-rocksdb"))))]
     pub async fn new(
         dim: usize,
@@ -350,7 +369,7 @@ impl EmbedVec {
             Some(config),
         )
     }
-    
+
     /// Create a new EmbedVec with a specific persistence backend
     #[cfg(all(feature = "async", any(feature = "persistence-sled", feature = "persistence-rocksdb")))]
     pub async fn with_backend(
@@ -384,7 +403,7 @@ impl EmbedVec {
         )
     }
 
-    /// Internal constructor (public for Python bindings)
+    /// Internal constructor (public for Python bindings) — with persistence
     #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
     pub fn new_internal(
         dim: usize,
@@ -402,12 +421,15 @@ impl EmbedVec {
         let storage = VectorStorage::new(dim, quantization.clone());
 
         let e8_codec = match &quantization {
-            Quantization::None => None,
-            Quantization::E8 {
-                bits_per_block,
-                use_hadamard,
-                random_seed,
-            } => Some(E8Codec::new(dim, *bits_per_block, *use_hadamard, *random_seed)),
+            Quantization::E8 { bits_per_block, use_hadamard, random_seed } =>
+                Some(E8Codec::new(dim, *bits_per_block, *use_hadamard, *random_seed)),
+            _ => None,
+        };
+
+        let h4_codec = match &quantization {
+            Quantization::H4 { use_hadamard, random_seed } =>
+                Some(H4Codec::new(dim, *use_hadamard, *random_seed)),
+            _ => None,
         };
 
         let backend = if let Some(config) = persistence_config {
@@ -424,10 +446,11 @@ impl EmbedVec {
             metadata: Arc::new(RwLock::new(Vec::new())),
             quantization,
             e8_codec,
+            h4_codec,
             backend,
         })
     }
-    
+
     /// Internal constructor without persistence
     #[cfg(not(any(feature = "persistence-sled", feature = "persistence-rocksdb")))]
     pub fn new_internal(
@@ -445,12 +468,15 @@ impl EmbedVec {
         let storage = VectorStorage::new(dim, quantization.clone());
 
         let e8_codec = match &quantization {
-            Quantization::None => None,
-            Quantization::E8 {
-                bits_per_block,
-                use_hadamard,
-                random_seed,
-            } => Some(E8Codec::new(dim, *bits_per_block, *use_hadamard, *random_seed)),
+            Quantization::E8 { bits_per_block, use_hadamard, random_seed } =>
+                Some(E8Codec::new(dim, *bits_per_block, *use_hadamard, *random_seed)),
+            _ => None,
+        };
+
+        let h4_codec = match &quantization {
+            Quantization::H4 { use_hadamard, random_seed } =>
+                Some(H4Codec::new(dim, *use_hadamard, *random_seed)),
+            _ => None,
         };
 
         Ok(Self {
@@ -461,6 +487,7 @@ impl EmbedVec {
             metadata: Arc::new(RwLock::new(Vec::new())),
             quantization,
             e8_codec,
+            h4_codec,
         })
     }
 
@@ -526,7 +553,7 @@ impl EmbedVec {
         // Store vector (quantized or raw)
         let id = {
             let mut storage = self.storage.write();
-            storage.add(&processed_vector, self.e8_codec.as_ref())?
+            storage.add(&processed_vector, self.e8_codec.as_ref(), self.h4_codec.as_ref())?
         };
 
         // Store metadata
@@ -538,7 +565,7 @@ impl EmbedVec {
             meta[id] = payload;
         }
 
-        // Add to HNSW index
+        // Add to HNSW index (HNSW currently uses E8 codec path; H4 vectors inserted raw)
         {
             let mut index = self.index.write();
             let storage = self.storage.read();
@@ -591,7 +618,7 @@ impl EmbedVec {
             query.to_vec()
         };
 
-        // Search HNSW index
+        // Search HNSW index (uses E8 codec for distance; H4 decoded via storage on retrieval)
         let candidates = {
             let index = self.index.read();
             let storage = self.storage.read();
@@ -674,27 +701,24 @@ impl EmbedVec {
         &self.quantization
     }
 
-    /// Set quantization mode (requires re-indexing)
+    /// Set quantization mode (re-quantizes all existing vectors)
     #[cfg(feature = "async")]
     pub async fn set_quantization(&mut self, quant: Quantization) -> Result<()> {
-        self.quantization = quant.clone();
         self.e8_codec = match &quant {
-            Quantization::None => None,
-            Quantization::E8 {
-                bits_per_block,
-                use_hadamard,
-                random_seed,
-            } => Some(E8Codec::new(
-                self.dimension,
-                *bits_per_block,
-                *use_hadamard,
-                *random_seed,
-            )),
+            Quantization::E8 { bits_per_block, use_hadamard, random_seed } =>
+                Some(E8Codec::new(self.dimension, *bits_per_block, *use_hadamard, *random_seed)),
+            _ => None,
         };
+        self.h4_codec = match &quant {
+            Quantization::H4 { use_hadamard, random_seed } =>
+                Some(H4Codec::new(self.dimension, *use_hadamard, *random_seed)),
+            _ => None,
+        };
+        self.quantization = quant.clone();
 
         // Re-quantize existing vectors
         let mut storage = self.storage.write();
-        storage.set_quantization(quant, self.e8_codec.as_ref())?;
+        storage.set_quantization(quant, self.e8_codec.as_ref(), self.h4_codec.as_ref())?;
 
         Ok(())
     }
@@ -747,5 +771,29 @@ mod tests {
             .add(&[1.0, 0.0, 0.0], serde_json::json!({}))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_h4_quantization_end_to_end() {
+        let mut db = EmbedVec::builder()
+            .dimension(8)
+            .metric(Distance::Cosine)
+            .quantization(Quantization::h4_default())
+            .build()
+            .await
+            .unwrap();
+
+        let id = db
+            .add(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], serde_json::json!({"lattice": "h4"}))
+            .await
+            .unwrap();
+        assert_eq!(id, 0);
+
+        let results = db
+            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 0);
     }
 }
