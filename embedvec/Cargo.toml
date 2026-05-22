@@ -1,6 +1,6 @@
 [package]
 name = "embedvec"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["EmbedVec Contributors"]
 description = "Fast, lightweight, in-process vector database with HNSW indexing, E8/H4 lattice quantization (up to 24.8x compression), metadata filtering, and PyO3 bindings"
@@ -12,10 +12,12 @@ keywords = ["vector-database", "hnsw", "embedding", "quantization", "ann"]
 categories = ["database", "science", "algorithms"]
 
 [features]
-default = ["persistence-sled", "async"]
+default = ["persistence-fjall", "async"]
 # Legacy alias for backward compatibility
-persistence = ["persistence-sled"]
-# Sled backend - pure Rust, good default
+persistence = ["persistence-fjall"]
+# Fjall backend - pure Rust LSM-tree, primary default backend
+persistence-fjall = ["fjall"]
+# Sled backend - pure Rust embedded database
 persistence-sled = ["sled"]
 # RocksDB backend - higher performance for large datasets
 persistence-rocksdb = ["rocksdb"]
@@ -26,8 +28,10 @@ simd = []  # Enable SIMD optimizations
 python = ["pyo3"]
 # WASM support: disables persistence, uses wee_alloc for smaller binary
 wasm = ["wee_alloc"]
-# Full feature set for benchmarking
-full = ["persistence-sled", "async", "simd"]
+# Full feature set for benchmarking (fjall, the default backend)
+full = ["persistence-fjall", "async", "simd"]
+# Full with Sled
+full-sled = ["persistence-sled", "async", "simd"]
 # Full with RocksDB
 full-rocksdb = ["persistence-rocksdb", "async", "simd"]
 # Full with pgvector
@@ -42,6 +46,8 @@ serde_json = "1.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "macros"], optional = true }
 
 # Persistence backends
+# Fjall - pure Rust LSM-tree storage engine (primary default backend)
+fjall = { version = "2.11", optional = true }
 sled = { version = "0.34", optional = true }
 rocksdb = { version = "0.22", optional = true }
 
@@ -76,9 +82,14 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
 criterion = "0.5"
 approx = "0.5"
 tempfile = "3.10"
+memory-stats = "1.2"
 
 [[bench]]
 name = "hnsw_bench"
+harness = false
+
+[[bench]]
+name = "backend_bench"
 harness = false
 
 [lib]

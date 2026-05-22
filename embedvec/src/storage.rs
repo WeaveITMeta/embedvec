@@ -20,6 +20,12 @@ pub enum StoredVector {
     E8(E8EncodedVector),
     /// H4-quantized vector (4D blocks, 600-cell vertex indices)
     H4(H4EncodedVector),
+    /// Tombstone placeholder for a deleted slot.
+    ///
+    /// Holds no data and is never part of the HNSW graph, so it is never
+    /// traversed or returned by a search. It exists only to keep vector IDs
+    /// stable (id == position) across a delete + reopen cycle.
+    Tombstone,
 }
 
 impl StoredVector {
@@ -43,6 +49,8 @@ impl StoredVector {
                     vec![0.0; encoded.indices.len() * 4]
                 }
             }
+            // Deleted slot: no data to decode.
+            StoredVector::Tombstone => Vec::new(),
         }
     }
 
@@ -52,6 +60,7 @@ impl StoredVector {
             StoredVector::Raw(v) => v.len() * 4,
             StoredVector::E8(encoded) => encoded.size_bytes(),
             StoredVector::H4(encoded) => encoded.size_bytes(),
+            StoredVector::Tombstone => 0,
         }
     }
 }
@@ -169,6 +178,18 @@ impl VectorStorage {
     pub fn get_stored(&self, id: usize) -> Option<&StoredVector> {
         self.vectors.get(id)
     }
+
+    /// Append a pre-encoded stored vector without re-encoding.
+    ///
+    /// Used when reloading persisted vectors from disk: the on-disk form is
+    /// already a `StoredVector`, so we push it directly and only need to track
+    /// memory. Returns the assigned vector ID.
+    pub fn push_stored(&mut self, stored: StoredVector) -> usize {
+        self.memory_bytes += stored.size_bytes();
+        let id = self.vectors.len();
+        self.vectors.push(stored);
+        id
+    }
     
     /// Batch get multiple vectors by IDs (more efficient than individual gets)
     pub fn get_batch(
@@ -233,6 +254,12 @@ impl VectorStorage {
         let mut new_memory = 0usize;
 
         for stored in &self.vectors {
+            // Deleted slots carry no data — keep them as tombstones.
+            if matches!(stored, StoredVector::Tombstone) {
+                new_vectors.push(StoredVector::Tombstone);
+                continue;
+            }
+
             // First decode to f32 using whichever codec applies to current format
             let raw = stored.to_f32(e8_codec, h4_codec);
 
@@ -320,6 +347,8 @@ impl VectorStorage {
                     ))
                 }
             }
+            // Deleted slots are never in the graph; treat as infinitely far if reached.
+            StoredVector::Tombstone => Ok(f32::INFINITY),
         }
     }
 

@@ -19,7 +19,7 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::distance::Distance;
 use crate::filter::parse_simple_filter;
-#[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
+#[cfg(any(feature = "persistence-fjall", feature = "persistence-sled", feature = "persistence-rocksdb"))]
 use crate::persistence::BackendConfig;
 use crate::quantization::Quantization;
 use crate::{EmbedVec, Metadata};
@@ -82,15 +82,15 @@ impl PyEmbedVec {
         };
 
         // Convert persist_path to BackendConfig if provided
-        #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
+        #[cfg(any(feature = "persistence-fjall", feature = "persistence-sled", feature = "persistence-rocksdb"))]
         let persistence_config = persist_path.map(|p| BackendConfig::new(p));
         
         // Create EmbedVec using internal constructor
-        #[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
+        #[cfg(any(feature = "persistence-fjall", feature = "persistence-sled", feature = "persistence-rocksdb"))]
         let inner = EmbedVec::new_internal(dim, distance, m, ef_construction, quant, persistence_config)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         
-        #[cfg(not(any(feature = "persistence-sled", feature = "persistence-rocksdb")))]
+        #[cfg(not(any(feature = "persistence-fjall", feature = "persistence-sled", feature = "persistence-rocksdb")))]
         let inner = EmbedVec::new_internal(dim, distance, m, ef_construction, quant)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
@@ -141,6 +141,31 @@ impl PyEmbedVec {
         Ok(())
     }
 
+    /// Delete a vector by id.
+    ///
+    /// Returns True if the id existed and was removed, False if it was out of
+    /// range or already deleted.
+    fn delete(&mut self, id: usize) -> PyResult<bool> {
+        self.inner
+            .delete_internal(id)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Delete multiple vectors by id. Returns the number actually removed.
+    fn delete_many(&mut self, ids: Vec<usize>) -> PyResult<usize> {
+        let mut removed = 0;
+        for id in ids {
+            if self
+                .inner
+                .delete_internal(id)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Search for nearest neighbors
     ///
     /// # Arguments
@@ -186,27 +211,98 @@ impl PyEmbedVec {
         Ok(py_results.unbind())
     }
 
-    /// Get number of vectors in the database
+    /// Search many query vectors at once (run in parallel).
+    ///
+    /// # Arguments
+    /// * `query_vectors` - List of query vectors
+    /// * `k`, `ef_search`, `filter` - as in `search`
+    ///
+    /// # Returns
+    /// A list (one entry per query) of hit-dict lists.
+    #[pyo3(signature = (query_vectors, k=10, ef_search=128, filter=None))]
+    fn search_many(
+        &self,
+        py: Python<'_>,
+        query_vectors: Vec<Vec<f32>>,
+        k: usize,
+        ef_search: usize,
+        filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyList>> {
+        let filter_expr = if let Some(f) = filter {
+            let filter_value = pydict_to_metadata(f)?;
+            parse_simple_filter(&filter_value)
+        } else {
+            None
+        };
+
+        let all = self
+            .inner
+            .search_many_internal(&query_vectors, k, ef_search, filter_expr)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let py_all = PyList::empty_bound(py);
+        for results in all {
+            let py_results = PyList::empty_bound(py);
+            for hit in results {
+                let hit_dict = PyDict::new_bound(py);
+                hit_dict.set_item("id", hit.id)?;
+                hit_dict.set_item("score", hit.score)?;
+                hit_dict.set_item("payload", metadata_to_pyobject(py, &hit.payload)?)?;
+                py_results.append(hit_dict)?;
+            }
+            py_all.append(py_results)?;
+        }
+        Ok(py_all.unbind())
+    }
+
+    /// Get the metadata payload for a live id, or None if deleted/out of range.
+    fn get(&self, py: Python<'_>, id: usize) -> PyResult<Option<PyObject>> {
+        match self.inner.payload(id) {
+            Some(p) => Ok(Some(metadata_to_pyobject(py, &p)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether `id` refers to a live vector (enables `id in db`).
+    fn __contains__(&self, id: usize) -> bool {
+        self.inner.contains_id(id)
+    }
+
+    /// All live (id, payload) pairs as a list of {'id', 'payload'} dicts.
+    ///
+    /// Lets an adapter rebuild an external doc-id -> id map after reopening a
+    /// persisted store (ids are stable across reload).
+    fn entries(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let py_list = PyList::empty_bound(py);
+        for (id, payload) in self.inner.entries() {
+            let d = PyDict::new_bound(py);
+            d.set_item("id", id)?;
+            d.set_item("payload", metadata_to_pyobject(py, &payload)?)?;
+            py_list.append(d)?;
+        }
+        Ok(py_list.unbind())
+    }
+
+    /// Number of live (non-deleted) vectors
     fn __len__(&self) -> usize {
-        self.inner.storage.read().len()
+        self.inner.live_count()
     }
 
-    /// Get number of vectors
+    /// Number of live (non-deleted) vectors
     fn len(&self) -> usize {
-        self.inner.storage.read().len()
+        self.inner.live_count()
     }
 
-    /// Check if database is empty
+    /// Whether there are no live vectors
     fn is_empty(&self) -> bool {
-        self.inner.storage.read().is_empty()
+        self.inner.live_count() == 0
     }
 
-    /// Clear all vectors
+    /// Remove all vectors, metadata, deletion marks, and persisted records
     fn clear(&mut self) -> PyResult<()> {
-        self.inner.storage.write().clear();
-        self.inner.metadata.write().clear();
-        self.inner.index.write().clear();
-        Ok(())
+        self.inner
+            .clear_sync()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
     /// Get vector dimension

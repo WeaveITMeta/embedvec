@@ -69,7 +69,7 @@ impl From<serde_json::Error> for EmbedVecError {
     }
 }
 
-#[cfg(feature = "persistence")]
+#[cfg(feature = "persistence-sled")]
 impl From<sled::Error> for EmbedVecError {
     fn from(e: sled::Error) -> Self {
         EmbedVecError::PersistenceError(e.to_string())

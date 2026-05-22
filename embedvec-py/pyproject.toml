@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "embedvec-py"
-version = "0.5.0"
-description = "Fast, lightweight vector database with HNSW indexing and E8 quantization"
+version = "0.8.0"
+description = "Fast, lightweight vector database with HNSW indexing and E8/H4 quantization"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
@@ -27,9 +27,9 @@ classifiers = [
 keywords = ["vector-database", "hnsw", "embedding", "rag", "ann", "similarity-search"]
 
 [project.urls]
-Homepage = "https://github.com/embedvec/embedvec"
+Homepage = "https://github.com/WeaveITMeta/embedvec"
 Documentation = "https://docs.rs/embedvec"
-Repository = "https://github.com/embedvec/embedvec"
+Repository = "https://github.com/WeaveITMeta/embedvec"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

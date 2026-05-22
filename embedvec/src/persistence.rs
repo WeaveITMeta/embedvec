@@ -2,7 +2,8 @@
 //!
 //! ## Table of Contents
 //! - **PersistenceBackend**: Trait for pluggable storage backends
-//! - **SledBackend**: Sled-based persistence (default, pure Rust)
+//! - **FjallBackend**: Fjall-based persistence (default, pure Rust LSM-tree)
+//! - **SledBackend**: Sled-based persistence (pure Rust)
 //! - **RocksDbBackend**: RocksDB-based persistence (higher performance)
 //! - **PgVectorBackend**: PostgreSQL with pgvector extension (native vector search)
 //! - **BackendConfig**: Configuration for backend selection
@@ -13,8 +14,10 @@ use serde::{de::DeserializeOwned, Serialize};
 /// Persistence backend type selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendType {
-    /// Sled - Pure Rust embedded database (default)
+    /// Fjall - Pure Rust LSM-tree storage engine (default, primary backend)
     #[default]
+    Fjall,
+    /// Sled - Pure Rust embedded database
     Sled,
     /// RocksDB - High-performance LSM-tree database
     RocksDb,
@@ -46,7 +49,7 @@ impl BackendConfig {
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            backend_type: BackendType::Sled,
+            backend_type: BackendType::Fjall,
             create_if_missing: true,
             cache_size: None,
             table_name: None,
@@ -108,7 +111,20 @@ pub trait PersistenceBackend: Send + Sync {
     
     /// Set a value for a key
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()>;
-    
+
+    /// Set many key-value pairs at once.
+    ///
+    /// The default implementation issues individual `set` calls. Backends with
+    /// native write batches (e.g. Fjall, Sled) override this to commit all
+    /// pairs in a single atomic operation, dramatically improving bulk-load
+    /// throughput.
+    fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        for (key, value) in items {
+            self.set(key, value)?;
+        }
+        Ok(())
+    }
+
     /// Delete a key
     fn delete(&self, key: &[u8]) -> Result<()>;
     
@@ -151,6 +167,117 @@ pub trait PersistenceBackendExt: PersistenceBackend {
 impl<T: PersistenceBackend + ?Sized> PersistenceBackendExt for T {}
 
 // =============================================================================
+// Fjall Backend Implementation (default)
+// =============================================================================
+
+#[cfg(feature = "persistence-fjall")]
+mod fjall_backend {
+    use super::*;
+    use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+
+    /// Fjall-based persistence backend (default)
+    ///
+    /// Pure Rust log-structured merge-tree (LSM) storage engine. Combines
+    /// crash safety, low write amplification, and fast point lookups with
+    /// zero C/C++ dependencies, making it the primary embedded backend.
+    pub struct FjallBackend {
+        keyspace: Keyspace,
+        partition: PartitionHandle,
+    }
+
+    impl FjallBackend {
+        /// Open or create a fjall keyspace at the given path
+        pub fn open(config: &BackendConfig) -> Result<Self> {
+            // Keyspace-level config. The optional `cache_size` (shared with the
+            // other backends) sizes Fjall's block cache, which accelerates warm
+            // point lookups and prefix scans; if unset, Fjall's default is used.
+            let mut keyspace_config = Config::new(&config.path);
+            if let Some(cache) = config.cache_size {
+                keyspace_config = keyspace_config.cache_size(cache as u64);
+            }
+            let keyspace = keyspace_config
+                .open()
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))?;
+
+            // Partition-level tuning for vector workloads:
+            // - 32 MiB memtable (2x default) -> fewer flushes/compactions on bulk loads
+            // - no compression -> quantized / embedding payloads are effectively random,
+            //   so compression only burns CPU on every read and write without shrinking them
+            let create_options = PartitionCreateOptions::default()
+                .max_memtable_size(32 * 1024 * 1024)
+                .compression(fjall::CompressionType::None);
+            let partition = keyspace
+                .open_partition("embedvec", create_options)
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))?;
+
+            Ok(Self { keyspace, partition })
+        }
+    }
+
+    impl PersistenceBackend for FjallBackend {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.partition
+                .get(key)
+                .map(|opt| opt.map(|slice| slice.to_vec()))
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
+        }
+
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.partition
+                .insert(key, value)
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
+        }
+
+        fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+            // One atomic write batch -> a single journal append + memtable lock,
+            // instead of paying per-key overhead `items.len()` times.
+            let mut batch = self.keyspace.batch();
+            for (key, value) in items {
+                batch.insert(&self.partition, key.as_slice(), value.as_slice());
+            }
+            batch
+                .commit()
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.partition
+                .remove(key)
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
+        }
+
+        fn contains(&self, key: &[u8]) -> Result<bool> {
+            self.partition
+                .contains_key(key)
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
+        }
+
+        fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            let mut results = Vec::new();
+            for item in self.partition.prefix(prefix) {
+                let (key, value) = item
+                    .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))?;
+                results.push((key.to_vec(), value.to_vec()));
+            }
+            Ok(results)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.keyspace
+                .persist(PersistMode::SyncAll)
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
+        }
+
+        fn backend_type(&self) -> BackendType {
+            BackendType::Fjall
+        }
+    }
+}
+
+#[cfg(feature = "persistence-fjall")]
+pub use fjall_backend::FjallBackend;
+
+// =============================================================================
 // Sled Backend Implementation
 // =============================================================================
 
@@ -189,7 +316,18 @@ mod sled_backend {
                 .map(|_| ())
                 .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
         }
-        
+
+        fn set_batch(&self, items: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+            // Apply all writes atomically in a single sled batch.
+            let mut batch = sled::Batch::default();
+            for (key, value) in items {
+                batch.insert(key.as_slice(), value.as_slice());
+            }
+            self.db
+                .apply_batch(batch)
+                .map_err(|e| EmbedVecError::PersistenceError(e.to_string()))
+        }
+
         fn delete(&self, key: &[u8]) -> Result<()> {
             self.db
                 .remove(key)
@@ -692,9 +830,14 @@ pub use pgvector_backend::PgVectorBackend;
 // =============================================================================
 
 /// Create a persistence backend based on configuration
-#[cfg(any(feature = "persistence-sled", feature = "persistence-rocksdb"))]
+#[cfg(any(feature = "persistence-fjall", feature = "persistence-sled", feature = "persistence-rocksdb"))]
 pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn PersistenceBackend>> {
     match config.backend_type {
+        #[cfg(feature = "persistence-fjall")]
+        BackendType::Fjall => {
+            let backend = FjallBackend::open(config)?;
+            Ok(Box::new(backend))
+        }
         #[cfg(feature = "persistence-sled")]
         BackendType::Sled => {
             let backend = SledBackend::open(config)?;
@@ -704,6 +847,12 @@ pub fn create_backend(config: &BackendConfig) -> Result<Box<dyn PersistenceBacke
         BackendType::RocksDb => {
             let backend = RocksDbBackend::open(config)?;
             Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "persistence-fjall"))]
+        BackendType::Fjall => {
+            Err(EmbedVecError::PersistenceError(
+                "Fjall backend not enabled. Enable 'persistence-fjall' feature.".to_string()
+            ))
         }
         #[cfg(not(feature = "persistence-sled"))]
         BackendType::Sled => {
@@ -733,6 +882,11 @@ pub async fn create_backend_async(config: &BackendConfig) -> Result<Box<dyn Pers
             let backend = PgVectorBackend::connect(config).await?;
             Ok(Box::new(backend))
         }
+        #[cfg(feature = "persistence-fjall")]
+        BackendType::Fjall => {
+            let backend = FjallBackend::open(config)?;
+            Ok(Box::new(backend))
+        }
         #[cfg(feature = "persistence-sled")]
         BackendType::Sled => {
             let backend = SledBackend::open(config)?;
@@ -742,6 +896,12 @@ pub async fn create_backend_async(config: &BackendConfig) -> Result<Box<dyn Pers
         BackendType::RocksDb => {
             let backend = RocksDbBackend::open(config)?;
             Ok(Box::new(backend))
+        }
+        #[cfg(not(feature = "persistence-fjall"))]
+        BackendType::Fjall => {
+            Err(EmbedVecError::PersistenceError(
+                "Fjall backend not enabled. Enable 'persistence-fjall' feature.".to_string()
+            ))
         }
         #[cfg(not(feature = "persistence-sled"))]
         BackendType::Sled => {
@@ -771,9 +931,64 @@ mod tests {
         let config = BackendConfig::new("/tmp/test")
             .backend(BackendType::RocksDb)
             .cache_size(64 * 1024 * 1024);
-        
+
         assert_eq!(config.backend_type, BackendType::RocksDb);
         assert_eq!(config.cache_size, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_default_backend_is_fjall() {
+        let config = BackendConfig::new("/tmp/test");
+        assert_eq!(config.backend_type, BackendType::Fjall);
+        assert_eq!(BackendType::default(), BackendType::Fjall);
+    }
+
+    #[cfg(feature = "persistence-fjall")]
+    #[test]
+    fn test_fjall_backend() {
+        use std::env::temp_dir;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Create unique temp path
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = temp_dir().join(format!("embedvec_fjall_test_{}", timestamp));
+        let config = BackendConfig::new(path.to_str().unwrap());
+
+        let backend = FjallBackend::open(&config).unwrap();
+
+        // Test set/get
+        backend.set(b"key1", b"value1").unwrap();
+        let value = backend.get(b"key1").unwrap();
+        assert_eq!(value, Some(b"value1".to_vec()));
+
+        // Test contains
+        assert!(backend.contains(b"key1").unwrap());
+        assert!(!backend.contains(b"key2").unwrap());
+
+        // Test atomic batch insert + prefix scan
+        backend
+            .set_batch(&[
+                (b"vec:1".to_vec(), b"a".to_vec()),
+                (b"vec:2".to_vec(), b"b".to_vec()),
+            ])
+            .unwrap();
+        let scanned = backend.scan_prefix(b"vec:").unwrap();
+        assert_eq!(scanned.len(), 2);
+
+        // Test flush + backend type
+        backend.flush().unwrap();
+        assert_eq!(backend.backend_type(), BackendType::Fjall);
+
+        // Test delete
+        backend.delete(b"key1").unwrap();
+        assert!(!backend.contains(b"key1").unwrap());
+
+        // Cleanup
+        drop(backend);
+        let _ = std::fs::remove_dir_all(&path);
     }
     
     #[cfg(feature = "persistence-sled")]

@@ -15,6 +15,7 @@
 
 use crate::distance::Distance;
 use crate::e8::E8Codec;
+use crate::h4::H4Codec;
 use crate::error::Result;
 use crate::storage::VectorStorage;
 
@@ -146,6 +147,10 @@ pub struct HnswIndex {
     distance: Distance,
     /// Level multiplier for random layer assignment
     level_mult: f64,
+    /// H4 codec for decoding H4-quantized vectors during distance computation.
+    /// Set by the owner whenever H4 quantization is active; the E8 codec is
+    /// still threaded per-call. Without this, H4 vectors would decode to zeros.
+    h4_codec: Option<H4Codec>,
 }
 
 impl HnswIndex {
@@ -169,7 +174,24 @@ impl HnswIndex {
             ef_construction,
             distance,
             level_mult,
+            h4_codec: None,
         }
+    }
+
+    /// Set (or clear) the H4 codec used to decode H4-quantized vectors during
+    /// distance computation. Must be kept in sync with the active quantization.
+    pub fn set_h4_codec(&mut self, codec: Option<H4Codec>) {
+        self.h4_codec = codec;
+    }
+
+    /// HNSW `M` parameter (max connections per layer)
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// HNSW `ef_construction` parameter (beam width during construction)
+    pub fn ef_construction(&self) -> usize {
+        self.ef_construction
     }
 
     /// Insert a vector into the index
@@ -430,8 +452,8 @@ impl HnswIndex {
         if let Some(raw_slice) = storage.get_raw_slice(id) {
             return Ok(self.distance.compute(query, raw_slice));
         }
-        // Fall back to decoding for quantized vectors
-        let vector = storage.get(id, codec, None)?;
+        // Fall back to decoding for quantized vectors (E8 via param, H4 via field)
+        let vector = storage.get(id, codec, self.h4_codec.as_ref())?;
         Ok(self.distance.compute(query, &vector))
     }
 
@@ -445,7 +467,7 @@ impl HnswIndex {
         codec: Option<&E8Codec>,
     ) -> Result<()> {
         // Get node vector and current connections
-        let node_vector = storage.get(node_id, codec, None)?;
+        let node_vector = storage.get(node_id, codec, self.h4_codec.as_ref())?;
         
         let connections = {
             // Use direct indexing for O(1) lookup
@@ -459,7 +481,7 @@ impl HnswIndex {
         let mut neighbor_dists: Vec<(usize, f32)> = connections
             .iter()
             .filter_map(|&neighbor_id| {
-                storage.get(neighbor_id, codec, None).ok().map(|v| {
+                storage.get(neighbor_id, codec, self.h4_codec.as_ref()).ok().map(|v| {
                     let dist = self.distance.compute(&node_vector, &v);
                     (neighbor_id, dist)
                 })

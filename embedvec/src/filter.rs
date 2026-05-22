@@ -301,20 +301,95 @@ fn value_to_f64(value: &Value) -> Option<f64> {
 /// let filter = parse_simple_filter(&serde_json::json!({"category": "news"}));
 /// ```
 pub fn parse_simple_filter(obj: &Value) -> Option<FilterExpr> {
-    if let Value::Object(map) = obj {
-        let mut expr: Option<FilterExpr> = None;
+    let map = match obj {
+        Value::Object(m) => m,
+        _ => return None,
+    };
 
-        for (key, value) in map {
-            let field_filter = FilterExpr::eq(key.clone(), value.clone());
+    let mut expr: Option<FilterExpr> = None;
+    for (key, value) in map {
+        let part: Option<FilterExpr> = match key.as_str() {
+            "$and" => combine_filter_list(value, true),
+            "$or" => combine_filter_list(value, false),
+            "$not" => parse_simple_filter(value).map(FilterExpr::not),
+            _ => Some(parse_field_filter(key, value)),
+        };
+        if let Some(p) = part {
             expr = Some(match expr {
-                Some(e) => e.and(field_filter),
-                None => field_filter,
+                Some(e) => e.and(p),
+                None => p,
             });
         }
+    }
+    expr
+}
 
-        expr
-    } else {
-        None
+/// Combine a JSON array of sub-filters with AND (`is_and`) or OR.
+fn combine_filter_list(value: &Value, is_and: bool) -> Option<FilterExpr> {
+    let arr = value.as_array()?;
+    let mut expr: Option<FilterExpr> = None;
+    for item in arr {
+        if let Some(f) = parse_simple_filter(item) {
+            expr = Some(match expr {
+                Some(e) => {
+                    if is_and {
+                        e.and(f)
+                    } else {
+                        e.or(f)
+                    }
+                }
+                None => f,
+            });
+        }
+    }
+    expr
+}
+
+/// Parse `{ field: value }` or `{ field: { "$op": value, ... } }`.
+///
+/// A plain value is treated as equality (backward compatible). An object whose
+/// keys are *all* `$`-operators is expanded into the matching comparisons,
+/// AND-ed together.
+fn parse_field_filter(field: &str, value: &Value) -> FilterExpr {
+    if let Value::Object(ops) = value {
+        if !ops.is_empty() && ops.keys().all(|k| k.starts_with('$')) {
+            let mut expr: Option<FilterExpr> = None;
+            for (op, v) in ops {
+                if let Some(f) = build_op_filter(field, op, v) {
+                    expr = Some(match expr {
+                        Some(e) => e.and(f),
+                        None => f,
+                    });
+                }
+            }
+            return expr.unwrap_or(FilterExpr::All);
+        }
+    }
+    FilterExpr::eq(field, value.clone())
+}
+
+/// Map a single Mongo-style operator to a `FilterExpr` comparison.
+fn build_op_filter(field: &str, op: &str, v: &Value) -> Option<FilterExpr> {
+    match op {
+        "$eq" => Some(FilterExpr::eq(field, v.clone())),
+        "$ne" | "$neq" => Some(FilterExpr::neq(field, v.clone())),
+        "$gt" => Some(FilterExpr::gt(field, v.clone())),
+        "$gte" => Some(FilterExpr::gte(field, v.clone())),
+        "$lt" => Some(FilterExpr::lt(field, v.clone())),
+        "$lte" => Some(FilterExpr::lte(field, v.clone())),
+        "$in" => v.as_array().map(|a| FilterExpr::in_values(field, a.clone())),
+        "$nin" => v
+            .as_array()
+            .map(|a| FilterExpr::not(FilterExpr::in_values(field, a.clone()))),
+        "$contains" => v.as_str().map(|s| FilterExpr::contains(field, s)),
+        "$startswith" | "$starts_with" => v.as_str().map(|s| FilterExpr::starts_with(field, s)),
+        "$endswith" | "$ends_with" => v.as_str().map(|s| FilterExpr::ends_with(field, s)),
+        "$exists" => Some(if v.as_bool().unwrap_or(true) {
+            FilterExpr::exists(field)
+        } else {
+            FilterExpr::not(FilterExpr::exists(field))
+        }),
+        _ => None,
     }
 }
 
@@ -396,5 +471,58 @@ mod tests {
 
         let filter = parse_simple_filter(&filter_obj).unwrap();
         assert!(filter.matches(&meta));
+    }
+
+    #[test]
+    fn test_filter_parse_operators() {
+        let meta = json!({"category": "news", "ts": 1500, "tags": ["a", "b"], "title": "hello world"});
+
+        // Implicit eq + range operators (AND of multiple fields/ops).
+        let f = parse_simple_filter(&json!({
+            "category": "news",
+            "ts": {"$gte": 1000, "$lt": 2000}
+        }))
+        .unwrap();
+        assert!(f.matches(&meta));
+        assert!(!parse_simple_filter(&json!({"ts": {"$gte": 2000}}))
+            .unwrap()
+            .matches(&meta));
+
+        // $ne, $in, $contains, $exists
+        assert!(parse_simple_filter(&json!({"category": {"$ne": "blog"}}))
+            .unwrap()
+            .matches(&meta));
+        assert!(parse_simple_filter(&json!({"category": {"$in": ["news", "blog"]}}))
+            .unwrap()
+            .matches(&meta));
+        assert!(parse_simple_filter(&json!({"title": {"$contains": "world"}}))
+            .unwrap()
+            .matches(&meta));
+        assert!(parse_simple_filter(&json!({"category": {"$exists": true}}))
+            .unwrap()
+            .matches(&meta));
+        assert!(parse_simple_filter(&json!({"missing": {"$exists": false}}))
+            .unwrap()
+            .matches(&meta));
+    }
+
+    #[test]
+    fn test_filter_parse_boolean_composition() {
+        let meta = json!({"a": 1, "b": 5});
+
+        // $or
+        let or = parse_simple_filter(&json!({"$or": [{"a": 2}, {"b": 5}]})).unwrap();
+        assert!(or.matches(&meta));
+        assert!(!parse_simple_filter(&json!({"$or": [{"a": 2}, {"b": 6}]}))
+            .unwrap()
+            .matches(&meta));
+
+        // $and + $not
+        let and = parse_simple_filter(&json!({
+            "$and": [{"a": 1}, {"b": {"$gt": 3}}],
+            "$not": {"a": 2}
+        }))
+        .unwrap();
+        assert!(and.matches(&meta));
     }
 }

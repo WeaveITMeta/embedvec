@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/embedvec/badge.svg)](https://docs.rs/embedvec)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**The fastest pure-Rust vector database** — HNSW indexing, SIMD acceleration, E8 and H4 lattice quantization, and flexible persistence (Sled, RocksDB, or PostgreSQL/pgvector).
+**The fastest pure-Rust vector database** — HNSW indexing, SIMD acceleration, E8 and H4 lattice quantization, and flexible persistence (Fjall by default, plus Sled, RocksDB, or PostgreSQL/pgvector).
 
 ---
 
@@ -26,7 +26,7 @@
 
 1. **10-100× Lower Latency** — No network round-trips. embedvec runs in your process. Sub-millisecond queries are the norm, not the exception.
 
-2. **Up to 16× Less Memory** — E8 and H4 lattice quantization (from QuIP#/QTIP research) achieve 1.25–1.73 bits/dimension with <5% recall loss. Store 1M 768-dim vectors in ~196 MB instead of 3 GB.
+2. **Up to 24.8× Smaller Vectors** — E8 and H4 lattice quantization (from QuIP#/QTIP research) achieve 1.25–1.73 bits/dimension with <5% recall loss: 1M 768-dim vectors shrink from ~3 GB to ~196 MB (H4) / ~124 MB (E8). Note this is the *vector* footprint — the in-RAM HNSW graph adds ~2 KB/vector, so total index RAM at `M=16` is ~2.2 GB/1M (see [Memory Usage at Scale](#memory-usage-at-scale-768-dim-m16)).
 
 3. **No Infrastructure** — No Docker, no Kubernetes, no managed service bills. Just `cargo add embedvec`. Perfect for edge devices, mobile, WASM, and serverless.
 
@@ -44,6 +44,8 @@
 | Multi-tenant SaaS | Consider | ✓ Better |
 | >100M vectors | Consider pgvector | ✓ Better |
 
+> **Why the >100M line (and why the default backend doesn't move it):** embedvec's HNSW index and vector cache are held **in RAM**, and the index is **rebuilt on open** by reloading every record from the backend — search never touches disk. Measured resident cost is **~2.2 KB/vector** for H4/E8 and ~5.1 KB for raw at `M=16`, because the graph + metadata dominate the (compressed) vector. So **100M × 768-dim needs ~220 GB even with quantization** (~515 GB raw) — it does *not* fit in 128 GB. Fjall (the default) durably stores 100M+ vectors *on disk* and scales there to terabytes, but that doesn't change the in-RAM index ceiling. Past ~RAM scale (≈ tens of millions on a single node), a disk-paged, horizontally-scalable engine like pgvector wins. See [embedvec + Fjall vs pgvector](#embedvec--fjall-vs-pgvector); migrate via the same `BackendConfig` API.
+
 ---
 
 ## Why embedvec?
@@ -52,7 +54,7 @@
 - **Blazing Fast** — AVX2/FMA SIMD acceleration, optimized HNSW with O(1) lookups
 - **Memory Efficient** — H4 (~15.7×) and E8 (~24.8×) quantization with <5% recall loss
 - **Two Lattice Modes** — E8 (8D, 240 roots) for maximum compression; H4 (4D, 600-cell) for fast decoding
-- **Flexible Persistence** — Sled (pure Rust), RocksDB (high perf), or PostgreSQL/pgvector (distributed)
+- **Flexible Persistence** — Fjall (default, pure Rust LSM-tree), Sled (pure Rust), RocksDB (high perf), or PostgreSQL/pgvector (distributed)
 - **Production Ready** — Async API, metadata filtering, batch operations
 
 ---
@@ -67,13 +69,13 @@ All measurements on 768-dimensional vectors. Run `cargo bench -- lattice` to rep
 |--------|---------------|----------------|-----------------|
 | **Encode / 100 vectors** | 15.3 µs | 7.26 ms | 3.29 ms |
 | **Decode / 100 vectors** | 17.5 µs | 249 µs | 1.10 ms |
-| **Insert / 100 vectors** | 32.7 ms | 36.2 ms (+11%) | 905 ms (+27×) |
-| **Search / 10 queries (ef=64, 10k DB)** | 10.3 ms | 0.69 ms | 133 ms |
+| **Insert / 100 vectors** | 21.0 ms | 132 ms (+6.3×) | 501 ms (+24×) |
+| **Search / 10 queries (ef=64, 10k DB)** | 2.14 ms | 26.2 ms | 60.3 ms |
 | **Bytes / vector (768-dim)** | 3,072 B | **196 B** | **124 B** |
 | **Compression ratio** | 1× | **15.7×** | **24.8×** |
 | **Bits / dimension** | 32 | ~1.73 | ~1.25 |
 
-> **H4 search is fast** because HNSW indexes the raw float vector at insert time; the quantized H4 representation is used for storage only. E8 search decodes each candidate during HNSW graph traversal, adding decode overhead per distance call.
+> **Quantized search trades speed for memory — for *both* lattices.** The HNSW index stores only node ids and reads vectors from storage during traversal, so every distance computation against a quantized vector **decodes it on the fly**. Raw f32 is fastest (zero-copy, no decode); H4 decodes each candidate (~2.5 µs/vec), and E8 decodes each candidate (~11 µs/vec). Hence the ordering **raw < H4 < E8** for both insert and search. Quantization is a memory/recall optimization, not a latency one — pick it when RAM (not query latency) is the constraint. *(Earlier releases reported H4 search as faster than raw — that was a bug where H4 vectors silently decoded to zeros during graph traversal; fixed in v0.8.)*
 
 ### Core Operations (768-dim, 10k dataset, AVX2)
 
@@ -88,13 +90,41 @@ All measurements on 768-dimensional vectors. Run `cargo bench -- lattice` to rep
 | **Distance (euclidean)** | 108 ns/pair | 9.3M ops/sec |
 | **Distance (dot product)** | 91 ns/pair | 11M ops/sec |
 
-### Memory Usage at Scale (768-dim vectors)
+### Memory Usage at Scale (768-dim, M=16)
 
-| Mode | Bytes/Vector | 100k Vectors | 1M Vectors | Compression |
-|------|-------------|-------------|------------|-------------|
-| Raw f32 | 3,072 B | ~307 MB | ~3.07 GB | 1× |
-| **H4** | **196 B** | **~19.6 MB** | **~196 MB** | **15.7×** |
-| **E8 10-bit** | **124 B** | **~12.4 MB** | **~124 MB** | **24.8×** |
+embedvec keeps the HNSW graph **and** the vector cache resident in RAM (the index is rebuilt on open). At `M=16` the graph + metadata add **~2 KB/vector**, which *dominates* the compressed vector — quantization shrinks the vectors but not the graph. The columns below are **measured process RSS** (Windows 11, x86-64, small JSON payload per vector; raw confirmed linear at 100k→200k), extrapolated linearly above 200k.
+
+| Mode | Vector bytes | Total RAM/vector | 1M | 10M | 100M |
+|------|-------------|------------------|-----|------|------|
+| Raw f32 | 3,072 B | ~5.1 KB | ~5.1 GB | ~51 GB | ~515 GB |
+| **H4** | **196 B** | **~2.2 KB** | **~2.2 GB** | **~22 GB** | **~220 GB** |
+| **E8 10-bit** | **124 B** | **~2.1 KB** | **~2.1 GB** | **~21 GB** | **~213 GB** |
+
+> **What fits in RAM:** ~25M raw, or ~58M H4/E8 vectors per 128 GB. 100M needs ~220 GB even quantized — the graph + metadata, not the vectors, set the ceiling. Building/reopening is single-threaded HNSW insertion (~450 s for 100k H4 here, growing super-linearly), so multi-ten-million indexes already take hours to build *and* to reopen. The per-vector *vector* compression (15.7×/24.8×) is real and lowers the vector share, but total RAM is graph-bound.
+
+### Persistence Backend Comparison (200 B values)
+
+Embedded key-value throughput measured through the `PersistenceBackend` trait — the exact code path embedvec uses for on-disk storage. One-time `open` (~9–15 ms) and clean-shutdown costs are **excluded**; only steady-state work is timed. Reproduce with `cargo bench --bench backend_bench --features persistence-sled` (set `EMBEDVEC_BENCH_N` to change the record count).
+
+**10,000 records:**
+
+| Operation | Fjall (default) | Sled |
+|-----------|-----------------|------|
+| **Batched bulk-load** (`set_batch`) | **12.0 ms · 836 K/s** | 52.7 ms · 190 K/s |
+| Single writes (`set` × N + flush) | 50.4 ms · 198 K/s | 45.7 ms · 219 K/s |
+| **Random point `get`** (warm) | **0.78 µs · 1.28 M/s** | 0.98 µs · 1.02 M/s |
+| **Prefix scan** (full) | **3.07 ms · 3.26 M/s** | 5.46 ms · 1.83 M/s |
+
+**100,000 records — Fjall's lead widens with scale** (LSM design degrades far more gracefully than a B-tree as data grows):
+
+| Operation | Fjall (default) | Sled | Fjall speedup |
+|-----------|-----------------|------|:-------------:|
+| **Batched bulk-load** (`set_batch`) | **112 ms · 888 K/s** | 680 ms · 147 K/s | **6.0×** |
+| Single writes (`set` × N + flush) | **409 ms · 244 K/s** | 479 ms · 209 K/s | 1.17× |
+| **Random point `get`** (warm) | **1.64 µs · 610 K/s** | 1.81 µs · 553 K/s | 1.10× |
+| **Prefix scan** (full) | **54 ms · 1.85 M/s** | 85 ms · 1.17 M/s | 1.57× |
+
+> **Why Fjall is the default:** its LSM design wins on reads — point lookups and prefix/range scans (~57–77% faster) — and is **4–6× faster at batched bulk-load** via atomic `set_batch`. Crucially, the lead *grows with scale*: single-key writes flip from ~10% slower than Sled at 10k to ~17% faster at 100k, and batched bulk-load widens from ~4× to ~6×. It is 100% safe Rust with **no C/C++ dependencies**, crash-safe, and actively maintained. embedvec tunes it for vector payloads (32 MiB memtables, compression disabled, configurable block cache via `BackendConfig::cache_size`). Sled remains a solid alternative for small or short-lived stores (lower one-time `open`/shutdown cost); RocksDB (`--features persistence-rocksdb`) needs a C++/libclang toolchain to build. *Measured on Windows 11, x86-64, `bench` profile (LTO).*
 
 ---
 
@@ -107,7 +137,7 @@ All measurements on 768-dimensional vectors. Run `cargo bench -- lattice` to rep
 | **E8 Quantization** | 8D D8∪D8+½ lattice, 240 roots, ~1.25 bits/dim, 24.8× compression |
 | **H4 Quantization** | 4D 600-cell polytope, 120 vertices, ~1.73 bits/dim, 15.7× compression |
 | **Metadata Filtering** | Composable filters: eq, gt, lt, contains, AND/OR/NOT |
-| **Triple Persistence** | Sled (pure Rust), RocksDB (high perf), or pgvector (PostgreSQL) |
+| **Flexible Persistence** | Fjall (default, pure Rust LSM), Sled (pure Rust), RocksDB (high perf), or pgvector (PostgreSQL) |
 | **pgvector Integration** | Native PostgreSQL vector search with HNSW/IVFFlat indexes |
 | **Async API** | Tokio-compatible async operations |
 | **PyO3 Bindings** | First-class Python support with numpy interop |
@@ -119,7 +149,7 @@ All measurements on 768-dimensional vectors. Run `cargo bench -- lattice` to rep
 
 ```toml
 [dependencies]
-embedvec = "0.6"
+embedvec = "0.8"   # Fjall persistence backend + async are on by default
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
 serde_json = "1.0"
 ```
@@ -194,6 +224,12 @@ hits = db.search(query_vector=query, k=10, ef_search=128, filter={"tag": "news"}
 for hit in hits:
     print(f"score: {hit['score']:.4f}  id: {hit['id']}  {hit['payload']}")
 ```
+
+The Python API also exposes `add(vector, payload) -> id`, `delete(id)` / `delete_many(ids)`, `search_many(query_vectors, ...)` (parallel batch search), `get(id)`, `entries()` (all live `id`/`payload` pairs), and `id in db`. The `filter` argument accepts plain equality (`{"tag": "news"}`) **and** Mongo-style operators: `$eq $ne $gt $gte $lt $lte $in $nin $contains $startswith $endswith $exists`, plus `$and` / `$or` / `$not`, e.g. `{"ts": {"$gte": 1700000000}, "$or": [{"tag": "news"}, {"tag": "blog"}]}`.
+
+### Using embedvec with LangChain / LlamaIndex
+
+embedvec does not ship framework adapters — the Python bindings give you everything needed to write a thin `VectorStore` yourself: `add`/`add_many` (you supply the embeddings), `search`/`search_many` with operator filters, `delete`/`delete_many`, and `entries()`/`get()` to map your framework's string document ids to embedvec's stable integer ids (rebuild the map from `entries()` after reopening a persisted store). Keep document text in the metadata payload.
 
 ---
 
@@ -328,12 +364,13 @@ Based on QuIP#/NestQuant/QTIP research (2024–2025).
 
 ```toml
 [dependencies]
-embedvec = { version = "0.6", features = ["persistence-sled", "async"] }
+embedvec = { version = "0.8", features = ["persistence-fjall", "async"] }
 ```
 
 | Feature | Description | Default |
 |---------|-------------|---------|
-| `persistence-sled` | On-disk storage via Sled (pure Rust) | ✓ |
+| `persistence-fjall` | On-disk storage via Fjall (pure Rust LSM-tree) | ✓ |
+| `persistence-sled` | On-disk storage via Sled (pure Rust) | ✗ |
 | `persistence-rocksdb` | On-disk storage via RocksDB (higher perf) | ✗ |
 | `persistence-pgvector` | PostgreSQL with native vector search | ✗ |
 | `async` | Tokio async API | ✓ |
@@ -345,17 +382,41 @@ embedvec = { version = "0.6", features = ["persistence-sled", "async"] }
 
 ## Persistence Backends
 
-### Sled (Default)
-Pure Rust embedded database.
+When a persistence path is configured, every `add` / `add_many` writes the vector (in its compact stored form) plus metadata to the backend — `add_many` does this in a single atomic batch. On open, the store reloads all records and **rebuilds the HNSW index**. It is self-describing: it reopens with the same dimension, distance metric, and quantization it was created with, regardless of constructor arguments. Call `flush()` to force a durable sync.
+
+### Fjall (Default)
+
+Pure Rust log-structured merge-tree (LSM) storage engine — crash-safe, fast on reads and batched writes, with **no C/C++ dependencies**. Enabled by default, so `with_persistence` uses it automatically.
 
 ```rust
+// Fjall is the default backend — nothing extra to enable
 let db = EmbedVec::with_persistence("/path/to/db", 768, Distance::Cosine, 32, 200).await?;
+```
+
+```rust
+// Explicit form via BackendConfig
+let config = BackendConfig::new("/path/to/db").backend(BackendType::Fjall);
+let db = EmbedVec::with_backend(config, 768, Distance::Cosine, 32, 200).await?;
+```
+
+### Sled (Optional)
+
+```toml
+embedvec = { version = "0.8", default-features = false, features = ["persistence-sled", "async"] }
+```
+
+```rust
+// With Fjall disabled, select the backend explicitly (BackendConfig::new defaults to Fjall)
+let config = BackendConfig::new("/path/to/db").backend(BackendType::Sled);
+let db = EmbedVec::with_backend(config, 768, Distance::Cosine, 32, 200).await?;
 ```
 
 ### RocksDB (Optional)
 
+Requires a C++/libclang toolchain to build.
+
 ```toml
-embedvec = { version = "0.6", features = ["persistence-rocksdb", "async"] }
+embedvec = { version = "0.8", default-features = false, features = ["persistence-rocksdb", "async"] }
 ```
 
 ```rust
@@ -368,7 +429,7 @@ let db = EmbedVec::with_backend(config, 768, Distance::Cosine, 32, 200).await?;
 ### pgvector (PostgreSQL)
 
 ```toml
-embedvec = { version = "0.6", features = ["persistence-pgvector", "async"] }
+embedvec = { version = "0.8", default-features = false, features = ["persistence-pgvector", "async"] }
 ```
 
 ```rust
@@ -380,6 +441,29 @@ let backend = PgVectorBackend::connect(&config).await?;
 
 ---
 
+## embedvec + Fjall vs pgvector
+
+Both can store vectors durably, but they sit at different points on the scale curve. The decisive difference: **embedvec keeps the HNSW index in RAM and rebuilds it on open**, while **pgvector keeps the index on disk and pages it in**.
+
+| Aspect | embedvec + Fjall (default) | pgvector (PostgreSQL) |
+|--------|----------------------------|------------------------|
+| Deployment | In-process library, zero infra | Client/server database |
+| Index location | **RAM** (rebuilt on open) | **Disk**, paged via `shared_buffers` |
+| Dataset vs RAM | Must fit in RAM (~2.2 KB/vec at M=16) | Can far exceed RAM |
+| Query latency | **Sub-ms** (no network/disk hop) | ~2–10 ms (network + disk + planner) |
+| Practical scale (1 node) | ≈ tens of millions (RAM-bound) | **100M+** via partitioning / replicas |
+| Startup / build | Re-inserts every vector into RAM (hours at ≳10M) | Index persists on disk; no rebuild |
+| Writes | In-process; Fjall batches (~888 K/s bulk) | SQL inserts; MVCC, transactional |
+| Concurrency | In-proc readers (`RwLock`) | Many clients, full MVCC |
+| Durability / ops | Crash-safe LSM file; you own the file | Mature DB: WAL, backups, replication |
+| Best when | Corpus fits in RAM, want sub-ms + no servers | Corpus outgrows RAM, many clients, on-disk index |
+
+**Rule of thumb:** stay on embedvec + Fjall while your corpus comfortably fits in RAM (roughly **≤ tens of millions** of 768-dim vectors per ~128 GB) and you want zero-infra, sub-millisecond search. Move to pgvector when the corpus outgrows RAM, you need many concurrent clients, or you can't afford a multi-hour in-RAM rebuild on every start. The migration path is the same `BackendConfig` API — see [pgvector (PostgreSQL)](#pgvector-postgresql) above.
+
+> Fjall vs pgvector is **not** "embedded vs disk for the *index*." Fjall durably stores the vector *records* on disk (and scales there to terabytes), but embedvec still loads them into an **in-RAM** HNSW graph to serve queries. pgvector is the option when you need the *index itself* to live on disk.
+
+---
+
 ## Testing
 
 ```bash
@@ -387,6 +471,9 @@ cargo test
 
 # Lattice comparison benchmarks only
 cargo bench -- lattice
+
+# Persistence backend comparison (Fjall vs Sled)
+cargo bench --bench backend_bench --features persistence-sled
 
 # Full benchmark suite
 cargo bench
@@ -396,15 +483,14 @@ cargo bench
 
 ## Roadmap
 
-- **v0.6** (current): H4 lattice quantization, E8 fixes, lattice benchmark suite
-- **v0.7**: Delete support, batch queries, LangChain/LlamaIndex integration
-- **Future**: Hybrid sparse-dense, full-text + vector, SIMD-accelerated lattice decode
+- **v0.8** (current): Fjall default backend (pure Rust LSM) with atomic `set_batch`, end-to-end on-disk persistence, H4 search fix, delete support, batch queries (`search_many`), richer metadata-filter operators, and lattice + persistence benchmark suites
+- **Future**: Hybrid sparse-dense, full-text + vector, SIMD-accelerated lattice decode, async Python bindings, official LangChain/LlamaIndex adapters
 
 ---
 
 ## License
 
-MIT OR Apache-2.0
+MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
@@ -415,7 +501,7 @@ Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before sub
 - HNSW algorithm: Malkov & Yashunin (2016)
 - E8 quantization: Inspired by QuIP#, NestQuant, QTIP (2024–2025)
 - H4 quantization: Regular 600-cell polytope (icosahedral symmetry in ℝ⁴)
-- Rust ecosystem: serde, tokio, pyo3, sled
+- Rust ecosystem: serde, tokio, pyo3, fjall, sled
 
 ---
 
